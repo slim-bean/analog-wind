@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
+	"time"
 )
 
 type Wind struct {
@@ -28,11 +30,13 @@ func main() {
 	w1Pin = rpio.Pin(19)
 	w1Pin.Mode(rpio.Pwm)
 	w1Pin.Freq(64000)
-	w1Pin.DutyCycleWithPwmMode(0, 32, rpio.Balanced)
+	w1Pin.DutyCycleWithPwmMode(0, 128, rpio.Balanced)
+
+	tracker := newTracker()
 
 	connOpts := MQTT.NewClientOptions().AddBroker("mq.edjusted.com:1883").SetClientID("analog-wind").SetCleanSession(true)
 	connOpts.OnConnect = func(c MQTT.Client) {
-		if token := c.Subscribe("/ws/4/ind/wind_speed", byte(0), onMessageReceived); token.Wait() && token.Error() != nil {
+		if token := c.Subscribe("/ws/4/ind/wind_speed", byte(0), tracker.onMessageReceived); token.Wait() && token.Error() != nil {
 			panic(token.Error())
 		}
 	}
@@ -51,7 +55,22 @@ func main() {
 
 }
 
-func onMessageReceived(client MQTT.Client, message MQTT.Message) {
+type tracker struct {
+	mtx    sync.RWMutex
+	setVal uint32
+	actVal uint32
+}
+
+func newTracker() *tracker {
+	t := &tracker{
+		setVal: 0,
+		actVal: 0,
+	}
+	go func() { t.loop() }()
+	return t
+}
+
+func (t *tracker) onMessageReceived(client MQTT.Client, message MQTT.Message) {
 	var payload Wind
 	err := json.Unmarshal(message.Payload(), &payload)
 	if err != nil {
@@ -69,7 +88,31 @@ func onMessageReceived(client MQTT.Client, message MQTT.Message) {
 	// The volt meter is 0-3V, the output voltage of the PMW at full (32/32) will be 3.3V
 	// The cycleLen is 32, so we are really just close enough to just output the wind speed
 	// as the duty cycle
-	w1Pin.DutyCycleWithPwmMode(uint32(spd), 32, rpio.Balanced)
+	//w1Pin.DutyCycleWithPwmMode(uint32(spd), 32, rpio.Balanced)
+
+	t.update(uint32(spd) * 4)
 
 	fmt.Printf("Received message on topic: %s\nMessage: %s\n", message.Topic(), message.Payload())
+}
+
+func (t *tracker) update(set uint32) {
+	t.mtx.Lock()
+	t.setVal = set
+	t.mtx.Unlock()
+}
+
+func (t *tracker) loop() {
+	for {
+		t.mtx.RLock()
+		des := t.setVal
+		t.mtx.RUnlock()
+		if t.actVal < des {
+			t.actVal++
+			w1Pin.DutyCycleWithPwmMode(t.actVal, 128, rpio.Balanced)
+		} else if t.actVal > des {
+			t.actVal--
+			w1Pin.DutyCycleWithPwmMode(t.actVal, 128, rpio.Balanced)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
